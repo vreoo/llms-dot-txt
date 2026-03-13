@@ -90,6 +90,7 @@ llm-docs/
     ├── extracted/   # extracted text content
     └── docs/
         └── rabbitmq-llm.txt
+        └── rabbitmq-rag.jsonl
 ```
 
 The generated file:
