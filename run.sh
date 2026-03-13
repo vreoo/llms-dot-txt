@@ -2,174 +2,255 @@
 
 set -euo pipefail
 
-############################################
-# Configuration
-############################################
+########################################
+# Defaults
+########################################
 
-PROJECT_NAME="${1:-}"
-DOCS_URL="${2:-}"
-
+DEPTH=5
+WORKERS=4
 BASE_DIR="llm-docs"
-SITE_DIR="site"
-EXTRACTED_DIR="extracted"
-DOCS_DIR="docs"
 
-############################################
-# Logging Helpers
-############################################
+########################################
+# Logging
+########################################
+
+timestamp() {
+  date "+%Y-%m-%d %H:%M:%S"
+}
 
 log() {
-  echo "[INFO] $1"
+  echo "[$(timestamp)] INFO  $1"
 }
 
 success() {
-  echo "[SUCCESS] $1"
+  echo "[$(timestamp)] OK    $1"
 }
 
 error() {
-  echo "[ERROR] $1"
+  echo "[$(timestamp)] ERROR $1"
   exit 1
 }
 
-############################################
-# Validate Input
-############################################
+########################################
+# CLI
+########################################
 
-if [[ -z "$PROJECT_NAME" || -z "$DOCS_URL" ]]; then
-  error "Usage: ./generate-llm-docs.sh <project-name> <docs-url>"
-fi
+usage() {
+  echo "Usage:"
+  echo "  ./run.sh --name rabbitmq --url https://rabbitmq.com/docs"
+  exit 1
+}
 
-OUTPUT_ROOT="${BASE_DIR}/${PROJECT_NAME}"
-FINAL_DOC="${DOCS_DIR}/${PROJECT_NAME}-llm.txt"
+PROJECT=""
+URL=""
 
-############################################
-# Dependency Checks
-############################################
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --name)
+      PROJECT="$2"
+      shift 2
+      ;;
+    --url)
+      URL="$2"
+      shift 2
+      ;;
+    --depth)
+      DEPTH="$2"
+      shift 2
+      ;;
+    --workers)
+      WORKERS="$2"
+      shift 2
+      ;;
+    *)
+      usage
+      ;;
+  esac
+done
+
+[[ -z "$PROJECT" || -z "$URL" ]] && usage
+
+########################################
+# Paths
+########################################
+
+ROOT="$BASE_DIR/$PROJECT"
+SITE="$ROOT/site"
+EXTRACT="$ROOT/extracted"
+DOCS="$ROOT/docs"
+
+LLM_FILE="$DOCS/$PROJECT-llm.txt"
+RAG_FILE="$DOCS/$PROJECT-rag.jsonl"
+
+########################################
+# Dependency checks
+########################################
 
 log "Checking dependencies..."
 
-command -v httrack >/dev/null 2>&1 || error "HTTrack is not installed."
-command -v python3 >/dev/null 2>&1 || error "Python3 is not installed."
+command -v httrack >/dev/null || error "httrack not installed"
+command -v python3 >/dev/null || error "python3 not installed"
 
-python3 - <<EOF || error "Required Python packages missing. Run: pip install trafilatura tqdm"
+python3 - <<EOF || error "Install python deps: pip install trafilatura tqdm"
 import trafilatura
 import tqdm
 EOF
 
-success "All dependencies are installed."
+success "Dependencies satisfied"
 
-############################################
-# Create Directory Structure
-############################################
+########################################
+# Workspace
+########################################
 
-log "Creating directory structure..."
+log "Preparing workspace..."
 
-mkdir -p "${OUTPUT_ROOT}/${SITE_DIR}"
-mkdir -p "${OUTPUT_ROOT}/${EXTRACTED_DIR}"
-mkdir -p "${OUTPUT_ROOT}/${DOCS_DIR}"
+mkdir -p "$SITE" "$EXTRACT" "$DOCS"
 
-cd "$OUTPUT_ROOT"
+success "Workspace ready"
 
-success "Workspace ready at ${OUTPUT_ROOT}"
+########################################
+# Step 1 — Crawl docs
+########################################
 
-############################################
-# Step 1 — Mirror Documentation
-############################################
+log "Mirroring documentation..."
 
-log "Step 1: Downloading documentation site..."
+httrack "$URL" \
+  -O "$SITE" \
+  "+${URL}/*" \
+  "-*/blog/*" \
+  "-*/news/*" \
+  "-*/archive/*" \
+  "-*.jpg" "-*.png" "-*.gif" "-*.pdf" \
+  --depth="$DEPTH" \
+  --quiet
 
-httrack "$DOCS_URL" \
-  -O "$SITE_DIR" \
-  "+*" \
-  -v > /dev/null
+success "Website mirrored"
 
-success "Website mirrored successfully."
+########################################
+# Step 2 — Extract clean text
+########################################
 
-############################################
-# Step 2 — Extract Clean Text
-############################################
-
-log "Step 2: Extracting clean text from HTML..."
-
-python3 <<'PYTHON'
-import os
-from pathlib import Path
-import trafilatura
-from tqdm import tqdm
-
-INPUT_DIR = "site"
-OUTPUT_DIR = "extracted"
-
-Path(OUTPUT_DIR).mkdir(exist_ok=True)
-
-html_files = []
-
-for root, _, files in os.walk(INPUT_DIR):
-    for file in files:
-        if file.endswith(".html"):
-            html_files.append(os.path.join(root, file))
-
-for file_path in tqdm(html_files, desc="Processing HTML"):
-    with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-        html = f.read()
-
-    text = trafilatura.extract(
-        html,
-        include_tables=True,
-        include_comments=False
-    )
-
-    if not text:
-        continue
-
-    name = Path(file_path).stem
-    out_path = os.path.join(OUTPUT_DIR, f"{name}.txt")
-
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write(text)
-PYTHON
-
-success "Text extraction completed."
-
-############################################
-# Step 3 — Build LLM Documentation File
-############################################
-
-log "Step 3: Building final LLM documentation..."
+log "Extracting documentation content..."
 
 python3 <<PYTHON
 import os
+import json
+import hashlib
+from pathlib import Path
+import trafilatura
+from tqdm import tqdm
+from concurrent.futures import ProcessPoolExecutor
 
-INPUT_DIR = "${EXTRACTED_DIR}"
-OUTPUT_FILE = "${FINAL_DOC}"
+SITE = "$SITE"
+EXTRACT = "$EXTRACT"
+WORKERS = $WORKERS
 
-files = sorted(os.listdir(INPUT_DIR))
+Path(EXTRACT).mkdir(exist_ok=True)
 
-with open(OUTPUT_FILE, "w", encoding="utf-8") as out:
-    out.write("# ${PROJECT_NAME} Documentation for AI Agents\n\n")
-    out.write("Source: ${DOCS_URL}\n\n")
+html_files = []
 
-    for file in files:
-        path = os.path.join(INPUT_DIR, file)
+for root, _, files in os.walk(SITE):
+    for f in files:
+        if f.endswith(".html"):
+            html_files.append(os.path.join(root, f))
 
-        with open(path, "r", encoding="utf-8") as f:
-            content = f.read()
+seen_hashes = set()
 
-        title = file.replace(".txt","").replace("-"," ").title()
+def process_file(path):
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        html = f.read()
 
-        out.write(f"\n\n## {title}\n\n")
-        out.write(content)
+    result = trafilatura.extract(
+        html,
+        include_tables=True,
+        include_comments=False,
+        with_metadata=True
+    )
+
+    if not result:
+        return None
+
+    text = result
+
+    h = hashlib.md5(text.encode()).hexdigest()
+    if h in seen_hashes:
+        return None
+
+    seen_hashes.add(h)
+
+    title = trafilatura.extract_metadata(html)
+    title = title.title if title and title.title else Path(path).stem
+
+    return {
+        "title": title,
+        "content": text
+    }
+
+docs = []
+
+with ProcessPoolExecutor(max_workers=WORKERS) as ex:
+    for r in tqdm(ex.map(process_file, html_files), total=len(html_files)):
+        if r:
+            docs.append(r)
+
+out = Path(EXTRACT) / "docs.json"
+
+with open(out, "w") as f:
+    json.dump(docs, f)
+
+print("Extracted", len(docs), "documents")
 PYTHON
 
-success "LLM documentation file created."
+success "Extraction completed"
 
-############################################
-# Final Output
-############################################
+########################################
+# Step 3 — Build LLM file
+########################################
 
-log "Process completed."
+log "Generating LLM documentation..."
+
+python3 <<PYTHON
+import json
+from pathlib import Path
+
+DATA="$EXTRACT/docs.json"
+LLM="$LLM_FILE"
+RAG="$RAG_FILE"
+URL="$URL"
+PROJECT="$PROJECT"
+
+docs=json.load(open(DATA))
+
+docs=sorted(docs, key=lambda d: d["title"])
+
+with open(LLM,"w") as out:
+
+    out.write(f"# {PROJECT} Documentation (LLM Optimized)\\n\\n")
+    out.write(f"Source: {URL}\\n\\n")
+    out.write("Each section represents one documentation page.\\n")
+    out.write("---\\n")
+
+    for d in docs:
+        out.write(f"\\n## {d['title']}\\n\\n")
+        out.write(d["content"])
+        out.write("\\n\\n---\\n")
+
+with open(RAG,"w") as out:
+    for d in docs:
+        out.write(json.dumps(d)+"\\n")
+
+print("LLM + RAG files created")
+PYTHON
+
+success "Documentation generated"
+
+########################################
+# Done
+########################################
 
 echo
-echo "Generated file:"
-echo "${OUTPUT_ROOT}/${FINAL_DOC}"
+echo "Output files:"
+echo "  $LLM_FILE"
+echo "  $RAG_FILE"
 echo
+success "Process completed"
