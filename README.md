@@ -68,13 +68,13 @@ chmod +x run.sh
 Run the script with:
 
 ```
-./run.sh <project-name> <docs-url>
+./run.sh --name <project-name> --url <docs-url>
 ```
 
 Example:
 
 ```bash
-./run.sh rabbitmq https://www.rabbitmq.com/docs
+./run.sh --name rabbitmq --url https://rabbitmq.com/docs
 ```
 
 ---
